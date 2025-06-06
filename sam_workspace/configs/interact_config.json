@@ -1,1 +1,17 @@
-
+{
+  "generation": {
+    "max_length": 200,
+    "temperature": 0.8,
+    "top_k": 50,
+    "top_p": 0.9
+  },
+  "interface": {
+    "auto_evolve": true,
+    "dream_during_idle": true,
+    "conversation_history": 20
+  },
+  "privacy": {
+    "enable_private_context": true,
+    "anonymize_data": true
+  }
+}
