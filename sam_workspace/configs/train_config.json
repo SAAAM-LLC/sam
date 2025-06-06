@@ -1,1 +1,21 @@
-
+{
+  "model": {
+    "initial_hidden_dim": 768,
+    "initial_num_layers": 6,
+    "max_hidden_dim": 2048,
+    "neurochemical_enabled": true,
+    "biological_computing": true,
+    "emergent_representations": true,
+    "multi_level_evolution": true
+  },
+  "training": {
+    "batch_size": 4,
+    "learning_rate": 3e-5,
+    "max_steps": 100000,
+    "mixed_precision": true
+  },
+  "evolution": {
+    "evolve_every": 1000,
+    "dream_cycle_minutes": 0.2
+  }
+}
