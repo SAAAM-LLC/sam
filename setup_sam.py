@@ -513,9 +513,51 @@ Thumbs.db
                     "metadata": {k: v for k, v in data.items() if k != field}
                 }
         
-        # If conversation format, combine turns
-        if 'conversations' in data or 'messages' in data:
-            conversations = data.get('conversations', data.get('messages', []))
+        # Handle your specific format: messages with role/content/info
+        if 'messages' in data:
+            messages = data['messages']
+            text_parts = []
+            metadata = {"conversation_metadata": data.get('info', {})}
+            
+            for msg in messages:
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                info = msg.get('info', {})
+                
+                # Handle <think></think> <answer></answer> format
+                if role == 'assistant' and content:
+                    # Extract thinking process
+                    think_content = info.get('think_content', '')
+                    answer_content = info.get('answer_content', '')
+                    
+                    if think_content and answer_content:
+                        # Preserve the reasoning structure
+                        formatted_content = f"<think>{think_content}</think><answer>{answer_content}</answer>"
+                    else:
+                        # Extract from content if not in info
+                        formatted_content = content
+                    
+                    text_parts.append(f"{role}: {formatted_content}")
+                    
+                    # Add metadata
+                    if info.get('source'):
+                        metadata[f"{role}_source"] = info['source']
+                    if info.get('reference_answer'):
+                        metadata["reference_answer"] = info['reference_answer']
+                    if info.get('test_case'):
+                        metadata["test_case"] = info['test_case']
+                else:
+                    text_parts.append(f"{role}: {content}")
+            
+            if text_parts:
+                return {
+                    "text": "\n".join(text_parts),
+                    "metadata": metadata
+                }
+        
+        # If conversation format with different structure
+        if 'conversations' in data:
+            conversations = data['conversations']
             text_parts = []
             for turn in conversations:
                 if isinstance(turn, dict):
@@ -531,6 +573,200 @@ Thumbs.db
                 }
         
         return None
+    
+    def process_reasoning_dataset(self, dataset_path: str, output_dir: str = None, **kwargs):
+        """Specialized processing for reasoning datasets with <think></think> format"""
+        if output_dir is None:
+            output_dir = self.data_dir / "processed"
+        else:
+            output_dir = Path(output_dir)
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dataset_path = Path(dataset_path)
+        
+        logger.info(f"Processing reasoning dataset: {dataset_path}")
+        
+        # Reset stats
+        self.processed_examples = 0
+        self.skipped_examples = 0
+        self.error_examples = 0
+        
+        output_file = output_dir / f"reasoning_{dataset_path.stem}.jsonl"
+        
+        with open(dataset_path, 'r', encoding='utf-8') as infile, \
+             open(output_file, 'w', encoding='utf-8') as outfile:
+            
+            for line_num, line in enumerate(tqdm(infile, desc="Processing Reasoning Data")):
+                try:
+                    data = json.loads(line.strip())
+                    
+                    # Enhanced processing for reasoning format
+                    if 'messages' in data:
+                        messages = data['messages']
+                        processed_conversations = []
+                        
+                        for msg in messages:
+                            role = msg.get('role', 'unknown')
+                            content = msg.get('content', '')
+                            info = msg.get('info', {})
+                            
+                            processed_msg = {
+                                'role': role,
+                                'content': content,
+                                'source': info.get('source', ''),
+                                'metadata': {}
+                            }
+                            
+                            # Preserve reasoning structure for assistant messages
+                            if role == 'assistant':
+                                think_content = info.get('think_content', '')
+                                answer_content = info.get('answer_content', '')
+                                
+                                if think_content or answer_content:
+                                    processed_msg['reasoning'] = {
+                                        'think': think_content,
+                                        'answer': answer_content
+                                    }
+                                
+                                # Add reference data
+                                if info.get('reference_answer'):
+                                    processed_msg['reference_answer'] = info['reference_answer']
+                                if info.get('test_case'):
+                                    processed_msg['test_case'] = info['test_case']
+                            
+                            processed_conversations.append(processed_msg)
+                        
+                        # Create SAM training example
+                        sam_example = {
+                            "text": self._format_conversation_for_sam(processed_conversations),
+                            "metadata": {
+                                "source": str(dataset_path),
+                                "line_number": line_num,
+                                "format": "reasoning_conversation",
+                                "conversation_metadata": data.get('info', {}),
+                                "num_turns": len(processed_conversations)
+                            },
+                            "reasoning_data": processed_conversations  # Preserve full structure
+                        }
+                        
+                        outfile.write(json.dumps(sam_example, ensure_ascii=False) + "\n")
+                        self.processed_examples += 1
+                    else:
+                        # Fallback to standard processing
+                        processed = self._extract_text(data, 'content')
+                        
+                        if processed:
+                            sam_example = {
+                                "text": processed["text"],
+                                "metadata": {
+                                    "source": str(dataset_path),
+                                    "line_number": line_num,
+                                    "format": "reasoning_fallback",
+                                    **processed.get("metadata", {})
+                                }
+                            }
+                            
+                            outfile.write(json.dumps(sam_example, ensure_ascii=False) + "\n")
+                            self.processed_examples += 1
+                        else:
+                            self.skipped_examples += 1
+                            
+                except Exception as e:
+                    logger.warning(f"Error processing line {line_num}: {e}")
+                    self.error_examples += 1
+        
+        # Create dataset info
+        self._create_dataset_info(output_file, dataset_path, "reasoning")
+        
+        logger.info(f"Reasoning dataset processing complete:")
+        logger.info(f"  Processed: {self.processed_examples}")
+        logger.info(f"  Skipped: {self.skipped_examples}")
+        logger.info(f"  Errors: {self.error_examples}")
+        
+        return output_file
+    
+    def _format_conversation_for_sam(self, conversation: List[Dict]) -> str:
+        """Format conversation data optimally for SAM training"""
+        formatted_parts = []
+        
+        for turn in conversation:
+            role = turn['role']
+            content = turn['content']
+            
+            if role == 'assistant' and 'reasoning' in turn:
+                # Preserve reasoning structure
+                think = turn['reasoning']['think']
+                answer = turn['reasoning']['answer']
+                
+                if think and answer:
+                    # Format for SAM to learn reasoning patterns
+                    formatted_content = f"<think>{think}</think><answer>{answer}</answer>"
+                else:
+                    formatted_content = content
+            else:
+                formatted_content = content
+            
+            formatted_parts.append(f"{role}: {formatted_content}")
+        
+        return "\n".join(formatted_parts)
+    
+    def process_multiple_datasets(self, datasets_config: List[Dict], output_dir: str = None):
+        """Process multiple datasets with different formats"""
+        if output_dir is None:
+            output_dir = self.data_dir / "processed"
+        else:
+            output_dir = Path(output_dir)
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        processed_files = []
+        total_examples = 0
+        
+        for config in datasets_config:
+            dataset_path = config['path']
+            format_type = config.get('format', 'auto')
+            dataset_type = config.get('type', 'standard')  # 'reasoning', 'code', 'standard'
+            
+            logger.info(f"Processing dataset: {dataset_path} (format: {format_type}, type: {dataset_type})")
+            
+            try:
+                if dataset_type == 'reasoning':
+                    output_file = self.process_reasoning_dataset(dataset_path, output_dir)
+                else:
+                    output_file = self.process_dataset(
+                        dataset_path, 
+                        format_type, 
+                        output_dir,
+                        **config.get('options', {})
+                    )
+                
+                processed_files.append(output_file)
+                total_examples += self.processed_examples
+                
+                logger.info(f"✅ Processed {self.processed_examples} examples from {dataset_path}")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to process {dataset_path}: {e}")
+                continue
+        
+        # Create combined vocabulary if requested
+        vocab_file = output_dir / "combined_vocabulary.txt"
+        self.create_vocabulary_file(processed_files, vocab_file)
+        
+        # Create processing summary
+        summary = {
+            "processed_datasets": len(processed_files),
+            "total_examples": total_examples,
+            "output_files": [str(f) for f in processed_files],
+            "vocabulary_file": str(vocab_file)
+        }
+        
+        summary_file = output_dir / "processing_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"🎉 Processing complete! {len(processed_files)} datasets, {total_examples} total examples")
+        return processed_files, summary
     
     def _split_text(self, text: str, chunk_size: int, overlap: int) -> List[str]:
         """Split text into overlapping chunks"""
@@ -635,6 +871,8 @@ def main():
     
     # Dataset processing arguments
     parser.add_argument("--dataset", type=str, help="Path to dataset file")
+    parser.add_argument("--datasets-dir", type=str, help="Directory containing multiple datasets")
+    parser.add_argument("--datasets-config", type=str, help="JSON config file for multiple datasets")
     parser.add_argument("--format", type=str, default="auto",
                        choices=["auto", "jsonl", "json", "txt", "csv", "parquet", "huggingface"],
                        help="Dataset format")
@@ -644,6 +882,12 @@ def main():
                        help="Chunk size for text files")
     parser.add_argument("--overlap", type=int, default=100,
                        help="Overlap size for text chunks")
+    
+    # Processing options
+    parser.add_argument("--reasoning-format", action="store_true",
+                       help="Process as reasoning dataset with <think></think> format")
+    parser.add_argument("--parallel-workers", type=int, default=4,
+                       help="Number of parallel workers for processing")
     
     # Vocabulary arguments
     parser.add_argument("--create-vocab", action="store_true",
@@ -663,16 +907,81 @@ def main():
         logger.info("Directory structure created. Exiting.")
         return
     
-    # Process dataset if provided
-    if args.dataset:
-        processed_file = setup.process_dataset(
-            dataset_path=args.dataset,
-            format_type=args.format,
-            output_dir=args.output,
-            text_field=args.text_field,
-            chunk_size=args.chunk_size,
-            overlap=args.overlap
+    # Process datasets
+    if args.datasets_config:
+        # Process from config file
+        with open(args.datasets_config, 'r') as f:
+            datasets_config = json.load(f)
+        
+        processed_files, summary = setup.process_multiple_datasets(
+            datasets_config['datasets'], 
+            args.output
         )
+        
+    elif args.datasets_dir:
+        # Process all files in directory
+        datasets_dir = Path(args.datasets_dir)
+        datasets_config = []
+        
+        if not datasets_dir.exists():
+            logger.error(f"Directory not found: {datasets_dir}")
+            return
+        
+        # Scan for all supported file types
+        supported_extensions = {'.jsonl', '.json', '.txt', '.csv', '.parquet'}
+        
+        for file_path in datasets_dir.rglob('*'):
+            if file_path.suffix.lower() in supported_extensions:
+                config = {
+                    'path': str(file_path),
+                    'format': 'auto',
+                    'type': 'reasoning' if args.reasoning_format else 'standard',
+                    'options': {
+                        'text_field': args.text_field,
+                        'chunk_size': args.chunk_size,
+                        'overlap': args.overlap
+                    }
+                }
+                datasets_config.append(config)
+        
+        logger.info(f"Found {len(datasets_config)} files to process")
+        
+        if datasets_config:
+            processed_files, summary = setup.process_multiple_datasets(
+                datasets_config, 
+                args.output
+            )
+            
+            # Create vocabulary if requested
+            if args.create_vocab:
+                vocab_file = Path(args.output) / "combined_vocabulary.txt" if args.output else setup.data_dir / "vocabulary" / "combined_vocab.txt"
+                setup.create_vocabulary_file(
+                    [str(f) for f in processed_files],
+                    str(vocab_file),
+                    args.vocab_min_freq
+                )
+        else:
+            logger.warning("No supported files found in datasets directory")
+            return
+            
+    elif args.dataset:
+        # Process single dataset
+        if args.reasoning_format:
+            processed_file = setup.process_reasoning_dataset(
+                args.dataset,
+                args.output
+            )
+        else:
+            processed_file = setup.process_dataset(
+                dataset_path=args.dataset,
+                format_type=args.format,
+                output_dir=args.output,
+                text_field=args.text_field,
+                chunk_size=args.chunk_size,
+                overlap=args.overlap
+            )
+        
+        processed_files = [processed_file]
         
         # Create vocabulary if requested
         if args.create_vocab:
@@ -680,8 +989,11 @@ def main():
                 [str(processed_file)],
                 min_freq=args.vocab_min_freq
             )
+    else:
+        logger.error("Must specify --dataset, --datasets-dir, or --datasets-config")
+        return
     
-    logger.info("SAM setup complete!")
+    logger.info("🎉 SAM setup complete!")
 
 if __name__ == "__main__":
     main()
